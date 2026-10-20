@@ -2,8 +2,9 @@ import streamlit as st
 import sqlite3
 import json
 from openai import OpenAI
+from syllabus import SYLLABUS_DICT  # 导入你刚才建好的大纲字典
 
-# 1. 初始化 DeepSeek（请替换成你真实的 API Key）
+# 1. 初始化 DeepSeek
 client = OpenAI(
     api_key=st.secrets["DEEPSEEK_API_KEY"], 
     base_url="https://api.deepseek.com",
@@ -12,11 +13,11 @@ client = OpenAI(
 st.set_page_config(page_title="春考AI自适应题库", page_icon="🧠", layout="centered")
 st.title("🧠 春考汽修 - AI自适应刷题")
 
-# 2. 核心功能：让 AI 根据错题现场出题
+# 2. 核心功能：结合【大纲】+【真题风格】+【错题】现场出题
 def generate_variant_from_error(wrong_q):
-    # 去数据库里找 2 道真题作为风格参考
     conn = sqlite3.connect('tiku.db')
     cursor = conn.cursor()
+    # 取 2 道真题做风格参考
     cursor.execute("SELECT stem, options, explanation FROM questions WHERE stem != ? ORDER BY RANDOM() LIMIT 2", (wrong_q['stem'],))
     examples = cursor.fetchall()
     conn.close()
@@ -25,8 +26,16 @@ def generate_variant_from_error(wrong_q):
     for ex in examples:
         example_str += f"【风格参考真题】\n题干：{ex[0]}\n选项：{ex[1]}\n解析：{ex[2]}\n\n"
 
+    # 将大纲字典转换成文本，喂给 AI（让 AI 自己去大纲里找对应的知识点）
+    syllabus_str = "\n".join([f"【{k}】：{v}" for k, v in SYLLABUS_DICT.items()])
+
+    # 组装终极 Prompt
     prompt = f"""你是一个山东省春考车辆维修类专业的资深命题专家。
-请先阅读以下你过去的命题风格：
+在出题之前，请务必严格阅读并遵守以下山东省春考【考试大纲】的要求，绝对不能超纲：
+【考试大纲】
+{syllabus_str}
+
+接下来，请阅读你过去的命题风格：
 {example_str}
 
 现在，学生刚刚做错了下面这道题：
@@ -35,7 +44,7 @@ def generate_variant_from_error(wrong_q):
 选项：{wrong_q['options']}
 正确答案：{wrong_q['answer']}
 
-请深度分析该错题的考点，并模仿上述【风格参考真题】的设问方式、难度和专业术语，生成 1 道全新的变式选择题。
+请深度分析该错题的考点，并**在大纲规定的范围内**，模仿【风格参考真题】的设问方式，生成 1 道全新的变式选择题。
 要求：必须输出严格的 JSON 对象，格式如下：
 {{
   "stem": "题干内容",
@@ -54,7 +63,7 @@ def generate_variant_from_error(wrong_q):
     
     new_q = json.loads(response.choices[0].message.content)
     
-    # 把 AI 新生成的题存入数据库
+    # 存入数据库
     conn = sqlite3.connect('tiku.db')
     cursor = conn.cursor()
     cursor.execute('''
@@ -128,8 +137,8 @@ if len(questions) > 0:
             st.info(f"**解析：**\n{q['explanation']}")
             
             if not st.session_state.ai_generated:
-                st.warning("🤖 AI 导师发现你这个知识点薄弱，正在为你量身定制一道变式题，请稍候...")
-                with st.spinner("AI 正在疯狂出题中..."):
+                st.warning("🤖 AI 导师正在结合《考试大纲》，为你量身定制变式题...")
+                with st.spinner("AI 正在查阅大纲并出题中..."):
                     try:
                         new_q = generate_variant_from_error(q)
                         st.session_state.question_queue.insert(1, new_q)
