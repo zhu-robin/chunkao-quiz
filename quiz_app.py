@@ -2,7 +2,7 @@ import streamlit as st
 import sqlite3
 import json
 from openai import OpenAI
-from syllabus import SYLLABUS_DICT  # 导入你刚才建好的大纲字典
+from syllabus import SYLLABUS_DICT, get_syllabus  # 引入大纲字典和获取函数
 
 # 1. 初始化 DeepSeek
 client = OpenAI(
@@ -13,11 +13,34 @@ client = OpenAI(
 st.set_page_config(page_title="春考AI自适应题库", page_icon="🧠", layout="centered")
 st.title("🧠 春考汽修 - AI自适应刷题")
 
-# 2. 核心功能：结合【大纲】+【真题风格】+【错题】现场出题
+# 2. 左侧侧边栏：选择要练习的章节
+st.sidebar.header("⚙️ 刷题设置")
+# 从大纲字典中提取所有章节名称作为选项
+chapter_list = ["随机抽题"] + list(SYLLABUS_DICT.keys())
+selected_chapter = st.sidebar.selectbox("选择练习的知识点章节：", chapter_list)
+
+# 3. 初始加载题目（支持按章节过滤）
+def load_initial_questions(chapter):
+    conn = sqlite3.connect('tiku.db')
+    cursor = conn.cursor()
+    if chapter == "随机抽题":
+        cursor.execute("SELECT id, stem, options, answer, explanation, topic FROM questions ORDER BY RANDOM() LIMIT 3")
+    else:
+        cursor.execute("SELECT id, stem, options, answer, explanation, topic FROM questions WHERE topic = ? ORDER BY RANDOM() LIMIT 3", (chapter,))
+    rows = cursor.fetchall()
+    conn.close()
+    
+    if not rows:
+        st.warning(f"⚠️ 题库里暂时没有【{chapter}】分类的题目，请先去本地补充题库哦！")
+        return []
+        
+    return [{"id": r[0], "stem": r[1], "options": json.loads(r[2]), "answer": r[3], "explanation": r[4], "topic": r[5]} for r in rows]
+
+# 4. 核心功能：结合【精准大纲】+【真题风格】现场出题
 def generate_variant_from_error(wrong_q):
     conn = sqlite3.connect('tiku.db')
     cursor = conn.cursor()
-    # 取 2 道真题做风格参考
+    # 取 2 道同章节的真题做风格参考
     cursor.execute("SELECT stem, options, explanation FROM questions WHERE stem != ? ORDER BY RANDOM() LIMIT 2", (wrong_q['stem'],))
     examples = cursor.fetchall()
     conn.close()
@@ -26,16 +49,15 @@ def generate_variant_from_error(wrong_q):
     for ex in examples:
         example_str += f"【风格参考真题】\n题干：{ex[0]}\n选项：{ex[1]}\n解析：{ex[2]}\n\n"
 
-    # 将大纲字典转换成文本，喂给 AI（让 AI 自己去大纲里找对应的知识点）
-    syllabus_str = "\n".join([f"【{k}】：{v}" for k, v in SYLLABUS_DICT.items()])
+    # 关键升级：根据错题的 topic 标签，精准提取大纲要求！
+    topic = wrong_q.get('topic', '')
+    syllabus_req = get_syllabus(topic) if topic else "严格按照春考大纲出题，不可超纲。"
 
-    # 组装终极 Prompt
     prompt = f"""你是一个山东省春考车辆维修类专业的资深命题专家。
-在出题之前，请务必严格阅读并遵守以下山东省春考【考试大纲】的要求，绝对不能超纲：
-【考试大纲】
-{syllabus_str}
+请严格遵守以下针对【{topic}】章节的【考试大纲】要求，绝对不能超纲：
+【考纲要求】：{syllabus_req}
 
-接下来，请阅读你过去的命题风格：
+请先阅读以下你过去的命题风格：
 {example_str}
 
 现在，学生刚刚做错了下面这道题：
@@ -44,7 +66,7 @@ def generate_variant_from_error(wrong_q):
 选项：{wrong_q['options']}
 正确答案：{wrong_q['answer']}
 
-请深度分析该错题的考点，并**在大纲规定的范围内**，模仿【风格参考真题】的设问方式，生成 1 道全新的变式选择题。
+请深度分析该错题的考点，并模仿上述【风格参考真题】的设问方式，**在考纲规定的范围内**，生成 1 道全新的变式选择题。
 要求：必须输出严格的 JSON 对象，格式如下：
 {{
   "stem": "题干内容",
@@ -62,35 +84,28 @@ def generate_variant_from_error(wrong_q):
     )
     
     new_q = json.loads(response.choices[0].message.content)
+    new_q['topic'] = f"AI-{topic}" # 给 AI 生成的题也打上标签
     
     # 存入数据库
     conn = sqlite3.connect('tiku.db')
     cursor = conn.cursor()
     cursor.execute('''
-        INSERT INTO questions (subject, stem, options, answer, explanation, difficulty)
-        VALUES (?, ?, ?, ?, ?, ?)
-    ''', ("AI-错题衍生", new_q['stem'], json.dumps(new_q['options'], ensure_ascii=False), new_q['answer'], new_q['explanation'], new_q['difficulty']))
+        INSERT INTO questions (subject, stem, options, answer, explanation, difficulty, topic)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    ''', ("AI-错题衍生", new_q['stem'], json.dumps(new_q['options'], ensure_ascii=False), new_q['answer'], new_q['explanation'], new_q['difficulty'], new_q['topic']))
     conn.commit()
     conn.close()
     
     return new_q
 
-# 3. 初始加载题目
-def load_initial_questions():
-    conn = sqlite3.connect('tiku.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, stem, options, answer, explanation FROM questions ORDER BY RANDOM() LIMIT 3")
-    rows = cursor.fetchall()
-    conn.close()
-    return [{"id": r[0], "stem": r[1], "options": json.loads(r[2]), "answer": r[3], "explanation": r[4]} for r in rows]
-
 # 初始化 Session State
-if "question_queue" not in st.session_state:
-    st.session_state.question_queue = load_initial_questions()
+if "question_queue" not in st.session_state or st.session_state.get("current_chapter") != selected_chapter:
+    st.session_state.question_queue = load_initial_questions(selected_chapter)
     st.session_state.score = 0
     st.session_state.submitted = False
     st.session_state.user_choice = None
     st.session_state.ai_generated = False 
+    st.session_state.current_chapter = selected_chapter
 
 questions = st.session_state.question_queue
 
@@ -102,6 +117,7 @@ if len(questions) > 0:
     st.divider()
 
     st.subheader(f"{q['stem']}")
+    st.caption(f"所属大纲章节：{q.get('topic', '未分类')}")
 
     user_choice = st.radio(
         "请选择你的答案：",
@@ -137,8 +153,8 @@ if len(questions) > 0:
             st.info(f"**解析：**\n{q['explanation']}")
             
             if not st.session_state.ai_generated:
-                st.warning("🤖 AI 导师正在结合《考试大纲》，为你量身定制变式题...")
-                with st.spinner("AI 正在查阅大纲并出题中..."):
+                st.warning(f"🤖 AI 导师正在结合【{q.get('topic', '相关')}】的大纲，为你量身定制变式题...")
+                with st.spinner("AI 正在精准出题中..."):
                     try:
                         new_q = generate_variant_from_error(q)
                         st.session_state.question_queue.insert(1, new_q)
@@ -159,7 +175,7 @@ else:
     st.header("🎉 恭喜通关！")
     st.write(f"你的最终得分是：**{st.session_state.score}**")
     if st.button("重新开始", type="primary"):
-        st.session_state.question_queue = load_initial_questions()
+        st.session_state.question_queue = load_initial_questions(selected_chapter)
         st.session_state.score = 0
         st.session_state.submitted = False
         st.session_state.user_choice = None
