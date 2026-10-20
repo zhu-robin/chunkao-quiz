@@ -1,0 +1,16 @@
+# 保护你的机密文件
+.streamlit/
+secrets.toml
+
+# 忽略本地原始资料文件夹（防止把几百M的Word传上去）
+materials/
+
+# 忽略 Python 缓存文件
+__pycache__/
+*.pyc
+
+# 忽略本地测试脚本（如果你以后想传的话）
+generate_tiku.py
+auto_tag.py
+ultimate_processor.py
+add_column.py
