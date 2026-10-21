@@ -37,7 +37,7 @@ st.set_page_config(page_title="春考AI自适应题库", page_icon="🧠", layou
 
 DB_PATH = Path(__file__).resolve().parent / "tiku.db"
 API_BASE = "https://api.deepseek.com"
-MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-flash")
 
 QUESTIONS_PER_ROUND = 10      # 每轮题量（3 → 10）
 MAX_VARIANTS_PER_ROUND = 3    # 每轮 AI 变式题上限
