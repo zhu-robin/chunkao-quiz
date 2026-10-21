@@ -1,17 +1,15 @@
 """
-quiz_app.py — 春考汽修 · AI 自适应刷题（v3）
+quiz_app.py — 春考汽修 · AI 自适应刷题（v4）
 
-本版新增：
-1. 错题本：答错自动入库，按题干去重，再答对一次自动移出；支持「一键重练错题」
-2. 学情分析：分章节统计做题数/正确率，标出薄弱知识点，可生成 AI 诊断报告
-3. 每轮 10 题（QUESTIONS_PER_ROUND 可调），AI 变式题每轮上限 3 道，防止题量失控
-4. 提示功能：做题时可向 AI 要一个「不剧透答案」的启发式提示
-5. 抽题优先抽没做过的题，避免每轮都是同样的几道
-
-保留并沿用：
-- qtype 题型字段自动迁移、单选/多选自动区分
-- 答案归一化判分、AI 返回值校验、每题独立 widget key
-- AI 失败不死循环、DB 连接上下文管理、WAL
+本版包含：
+1. 多选题用逐项 checkbox（选项全部可见），提交后静态回显 ✅/❌
+2. AI 诊断改成结构化 JSON + finish_reason 检测 + 自动重试，杜绝半截报告
+3. 学情诊断落库（diagnoses 表），刷新不丢，点按钮才更新
+4. 错题本：答错自动入库，再答对一次自动移出，可一键抽 10 道重练
+5. 学情分析：分章节正确率 + 薄弱点 + AI 诊断 + 针对薄弱章节抽题
+6. 每轮 10 题，AI 变式题每轮上限 3 道，做题时可要「不剧透」的提示
+7. 单选/多选以 qtype 为准、答案长度兜底；答案归一化判分
+8. 老库自动迁移（补 qtype 列、重建 attempts/diagnoses 表）
 
 依赖：streamlit / pandas / openai / syllabus.py
 """
@@ -39,7 +37,7 @@ DB_PATH = Path(__file__).resolve().parent / "tiku.db"
 API_BASE = "https://api.deepseek.com"
 MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-flash")
 
-QUESTIONS_PER_ROUND = 10      # 每轮题量（3 → 10）
+QUESTIONS_PER_ROUND = 10      # 每轮题量
 MAX_VARIANTS_PER_ROUND = 3    # 每轮 AI 变式题上限
 WEAK_ACCURACY = 0.6           # 正确率低于 60% 视为薄弱
 WEAK_MIN_ATTEMPTS = 2         # 至少做 2 题才纳入薄弱判定
@@ -74,6 +72,7 @@ def parse_options(raw) -> list:
 
 
 def is_multi(q: dict) -> bool:
+    """qtype 明确标了多选就是多选；否则看答案字母数。"""
     qt = str(q.get("qtype") or "").strip().lower()
     if qt in MULTI_ALIASES:
         return True
@@ -107,7 +106,7 @@ def db():
 
 @st.cache_resource(show_spinner=False)
 def ensure_db():
-    """建表 + 老库补 qtype 列并回填 + 新建 attempts 表 + WAL。"""
+    """建表 + 老库补 qtype 列并回填 + attempts/diagnoses 表 + WAL。"""
     with db() as conn:
         try:
             conn.execute("PRAGMA journal_mode=WAL")
@@ -159,6 +158,19 @@ def ensure_db():
             """
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_attempts_student ON attempts(student)")
+
+        # 学情诊断报告：落库，刷新不丢
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS diagnoses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                student TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                payload TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_diag_student ON diagnoses(student)")
     return True
 
 
@@ -191,7 +203,7 @@ def _query_questions(where_sql: str, params: list, limit: int):
 
 
 def load_questions(chapter: str, student: str, limit: int = QUESTIONS_PER_ROUND) -> list:
-    """优先抽这位学生还没做过的题；不够时退回全库随机（去重）。"""
+    """优先抽没做过的题；不够时退回全库随机（去重）。"""
     conds, params = [], []
     if chapter != RANDOM_CHAPTER:
         conds.append("topic = ?")
@@ -312,7 +324,7 @@ def build_wrong_round(student: str, limit: int = QUESTIONS_PER_ROUND) -> list:
         return []
     random.shuffle(items)
     qs = []
-    for r in items[: limit * 2]:
+    for r in items:
         try:
             options = parse_options(r["options"])
         except Exception:
@@ -349,6 +361,27 @@ def get_client() -> OpenAI:
         st.error("❌ 未找到 DEEPSEEK_API_KEY，请在 .streamlit/secrets.toml 或环境变量中配置。")
         st.stop()
     return OpenAI(api_key=api_key, base_url=API_BASE, timeout=60, max_retries=1)
+
+
+def call_json(prompt: str, max_tokens: int = 2000, temperature: float = 0.4, attempts: int = 2) -> dict:
+    """强制 JSON 输出；截断或解析失败会自动重试，避免把半截内容当成结果。"""
+    last = None
+    for _ in range(attempts):
+        try:
+            resp = get_client().chat.completions.create(
+                model=MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=temperature,
+                max_tokens=max_tokens,
+                response_format={"type": "json_object"},
+            )
+            choice = resp.choices[0]
+            if choice.finish_reason == "length":
+                raise ValueError("输出被 max_tokens 截断")
+            return json.loads(choice.message.content)
+        except Exception as e:
+            last = e
+    raise last
 
 
 def fetch_examples(topic: str, exclude_stem: str, limit: int = 2):
@@ -469,14 +502,8 @@ def save_question(q: dict, topic: str) -> None:
 
 
 def generate_variant(wrong_q: dict) -> dict:
-    resp = get_client().chat.completions.create(
-        model=MODEL,
-        messages=[{"role": "user", "content": build_prompt(wrong_q)}],
-        temperature=0.7,
-        max_tokens=1200,
-        response_format={"type": "json_object"},
-    )
-    new_q = parse_ai_question(json.loads(resp.choices[0].message.content))
+    raw = call_json(build_prompt(wrong_q), max_tokens=1500, temperature=0.7, attempts=2)
+    new_q = parse_ai_question(raw)
     new_q["topic"] = wrong_q["topic"]
     new_q["qtype"] = guess_qtype(new_q["answer"])
     new_q["_uid"] = uuid.uuid4().hex[:8]
@@ -492,7 +519,7 @@ def generate_hint(q: dict) -> str:
 
 请给一个「启发式提示」，帮他自己想出来：
 - 点出这道题考查的关键概念、结构原理或判断依据
-- 如果适合，给一个排除思路（比如「先看气门与凸轮轴的相对位置」）
+- 如果适合，给一个排除思路
 - 150 字以内，口语化，像老师当面点拨
 - 绝对不要说破正确答案，也不要逐个点评选项
 只输出提示正文。"""
@@ -500,17 +527,19 @@ def generate_hint(q: dict) -> str:
         model=MODEL,
         messages=[{"role": "user", "content": prompt}],
         temperature=0.5,
-        max_tokens=300,
+        max_tokens=400,
     )
     return resp.choices[0].message.content.strip()
 
 
-def generate_diagnosis(student: str, stats: list, wrong_items: list) -> str:
+def generate_diagnosis(student: str, stats: list, wrong_items: list) -> dict:
     lines = "\n".join(
         f"- {s['topic']}：{s['total']} 题，正确率 {s['correct'] / s['total']:.0%}"
         for s in stats if s["total"]
     )
-    wrong = "\n".join(f"- [{w.get('topic', '')}] {w.get('stem', '')[:60]}" for w in wrong_items[:10]) or "（暂无）"
+    wrong = "\n".join(
+        f"- [{w.get('topic', '')}] {w.get('stem', '')[:60]}" for w in wrong_items[:10]
+    ) or "（暂无）"
 
     prompt = f"""你是一位山东省春考车辆维修类专业的资深教师，正在给一位学生做学情诊断。
 
@@ -521,25 +550,46 @@ def generate_diagnosis(student: str, stats: list, wrong_items: list) -> str:
 【最近的错题】
 {wrong}
 
-请用 Markdown 输出，控制在 350 字以内：
+请严格输出 JSON 对象，不要输出任何多余文字，结构如下：
+{{
+  "summary": "一句话总结当前水平和主要问题（40 字以内）",
+  "weak_points": [
+    {{"topic": "章节名（必须用上面数据里的章节名）",
+      "why": "这个知识点的典型误区，结合上面的错题说（60 字以内）",
+      "advice": "一条具体可执行的做法，禁止写「多做题」「认真复习」这类空话（60 字以内）"}}
+  ],
+  "plan": ["第1天：练哪个章节 + 具体动作", "第2天：...", "第3天：..."]
+}}
 
-### 最薄弱的 2~3 个知识点
-逐条说明「这块考什么、他为什么容易错」。
+要求：weak_points 2~3 条；plan 恰好 3 条；全部简体中文。"""
 
-### 针对性建议
-每个薄弱点给 1 条具体可执行的做法，不要写「多做题」「认真复习」这类空话。
+    data = call_json(prompt, max_tokens=2000, temperature=0.4, attempts=2)
 
-### 接下来 3 天的练习顺序
-编号列表，写清每天练哪个章节、重点看什么。
+    if not isinstance(data.get("weak_points"), list) or not data["weak_points"]:
+        raise ValueError("AI 返回的 weak_points 为空")
+    return data
 
-只输出正文，不要复述上面的原始数据。"""
-    resp = get_client().chat.completions.create(
-        model=MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.5,
-        max_tokens=800,
-    )
-    return resp.choices[0].message.content.strip()
+
+def save_diagnosis(student: str, data: dict) -> None:
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO diagnoses (student, created_at, payload) VALUES (?, ?, ?)",
+            (student, now_str(), json.dumps(data, ensure_ascii=False)),
+        )
+
+
+def load_latest_diagnosis(student: str):
+    with db() as conn:
+        row = conn.execute(
+            "SELECT payload, created_at FROM diagnoses WHERE student = ? ORDER BY id DESC LIMIT 1",
+            (student,),
+        ).fetchone()
+    if not row:
+        return None
+    try:
+        return {"data": json.loads(row["payload"]), "created_at": row["created_at"]}
+    except Exception:
+        return None
 
 
 # ============================== 状态流转 ==============================
@@ -598,6 +648,24 @@ def render_finished(student: str) -> None:
             st.rerun()
 
 
+def render_answer_review(q: dict) -> None:
+    """已提交：不再渲染输入控件，改成静态列表回显，标出正确答案和你选的。"""
+    res = st.session_state.get("result") or {}
+    correct = res.get("correct", "")
+    chosen = res.get("chosen", "")
+
+    lines = []
+    for i, opt in enumerate(q["options"]):
+        letter = chr(65 + i)
+        if letter in correct:
+            lines.append(f"- ✅ **{opt}**　← 正确答案")
+        elif letter in chosen:
+            lines.append(f"- ❌ {opt}　← 你选的")
+        else:
+            lines.append(f"- ▫️ {opt}")
+    st.markdown("\n".join(lines))
+
+
 def render_feedback(student: str, q: dict) -> None:
     res = st.session_state.get("result") or {}
 
@@ -614,7 +682,7 @@ def render_feedback(student: str, q: dict) -> None:
             next_question()
         return
 
-    # AI 变式题：每轮有额度上限，用完就直接下一题
+    # AI 变式题：每轮有额度上限，用完直接下一题
     if st.session_state.get("variants_used", 0) >= MAX_VARIANTS_PER_ROUND:
         st.caption("本轮 AI 变式题额度已用完，这道题已记入错题本。")
         if st.button("下一题 ➡️", type="primary", use_container_width=True):
@@ -656,16 +724,24 @@ def render_question(student: str) -> None:
     st.subheader(q["stem"])
     st.caption(f"所属大纲章节：{q['topic']} ｜ 题型：{'多选题' if multi else '单选题'}")
 
-    key = f"choice_{q['_uid']}"
-    if multi:
-        st.info("📝 提示：本题为多项选择题")
-        picked = st.multiselect("请选择你的答案（可多选）：", q["options"], key=key, disabled=not editable)
-    else:
-        picked = st.radio("请选择你的答案：", q["options"], index=None, key=key, disabled=not editable)
-
+    # 已提交：静态回显选项 + 反馈，不再渲染输入控件
     if not editable:
+        render_answer_review(q)
         render_feedback(student, q)
         return
+
+    key = f"choice_{q['_uid']}"
+
+    if multi:
+        st.info("📝 提示：本题为多项选择题，请勾选所有正确选项")
+        picked = []
+        for i, opt in enumerate(q["options"]):
+            if st.checkbox(opt, key=f"{key}_{i}"):
+                picked.append(opt)
+        if not picked:
+            st.caption("（勾选完点下方「提交答案」）")
+    else:
+        picked = st.radio("请选择你的答案：", q["options"], index=None, key=key)
 
     hint = st.session_state.hints.get(q["_uid"])
     if hint:
@@ -686,7 +762,7 @@ def render_question(student: str) -> None:
 
     if submitted:
         if not picked:
-            st.warning("请先选择一个选项！")
+            st.warning("请先选择至少一个选项！")
             return
         correct = normalize_answer(q["answer"])
         chosen = choice_letters(q, picked)
@@ -742,7 +818,8 @@ def render_wrong_book(student: str) -> None:
 
     topic_count = {}
     for r in items:
-        topic_count[r.get("topic") or "未分类"] = topic_count.get(r.get("topic") or "未分类", 0) + 1
+        t = r.get("topic") or "未分类"
+        topic_count[t] = topic_count.get(t, 0) + 1
     summary = " ｜ ".join(f"{k} {v} 道" for k, v in sorted(topic_count.items(), key=lambda x: -x[1]))
     st.caption(f"{student} 目前有 {len(items)} 道错题（同一题再答对一次就会移出）")
     st.caption(f"分布：{summary}")
@@ -773,6 +850,31 @@ def render_wrong_book(student: str) -> None:
 
 
 # ============================== 学情分析 ==============================
+def render_diagnosis(student: str) -> None:
+    diag = load_latest_diagnosis(student)
+    if not diag:
+        return
+    data = diag["data"]
+    st.subheader("AI 学情诊断")
+    st.caption(f"生成时间：{diag['created_at']}　（点「让 AI 分析」可更新）")
+
+    if data.get("summary"):
+        st.info(data["summary"])
+
+    for wp in data.get("weak_points", []):
+        st.markdown(f"**{wp.get('topic', '')}**")
+        if wp.get("why"):
+            st.write(wp["why"])
+        if wp.get("advice"):
+            st.markdown(f"> 💡 {wp['advice']}")
+
+    plan = data.get("plan") or []
+    if plan:
+        st.markdown("**接下来 3 天**")
+        for i, step in enumerate(plan, 1):
+            st.write(f"{i}. {step}")
+
+
 def render_analytics(student: str) -> None:
     st.header("📊 学情分析")
     stats, overall = load_stats(student)
@@ -822,13 +924,16 @@ def render_analytics(student: str) -> None:
     c1, c2 = st.columns(2)
     with c1:
         if st.button("🤖 让 AI 分析我的薄弱点", type="primary", use_container_width=True):
+            ok = False
             with st.spinner("AI 老师正在看你的答题记录..."):
                 try:
-                    text = generate_diagnosis(student, stats, load_wrong_book(student, 10))
-                    st.session_state.diag = {"student": student, "text": text}
+                    data = generate_diagnosis(student, stats, load_wrong_book(student, 10))
+                    save_diagnosis(student, data)
+                    ok = True
                 except Exception as e:
                     st.error(f"分析失败：{type(e).__name__}: {e}")
-            st.rerun()
+            if ok:
+                st.rerun()
     with c2:
         if weak and st.button("🎯 针对薄弱章节练 10 题", use_container_width=True):
             qs = load_questions_by_topics([w["topic"] for w in weak[:3]], student, QUESTIONS_PER_ROUND)
@@ -839,10 +944,7 @@ def render_analytics(student: str) -> None:
             else:
                 st.warning("这些章节暂时没有可抽的题目（可能都做过了）。")
 
-    diag = st.session_state.get("diag")
-    if diag and diag.get("student") == student:
-        st.subheader("AI 学情诊断")
-        st.markdown(diag["text"])
+    render_diagnosis(student)
 
 
 # ============================== 入口 ==============================
@@ -857,9 +959,10 @@ def main() -> None:
         student = st.text_input("学生姓名", key="student").strip() or DEFAULT_STUDENT
         st.divider()
 
-    pending = st.session_state.pop("_pending_page", None)
+    pending = st.session_state.get("_pending_page")
     if pending:
         st.session_state.page = pending
+        del st.session_state["_pending_page"]
 
     page = st.sidebar.radio("功能导航", PAGES, key="page")
 
