@@ -1,15 +1,19 @@
 """
-quiz_app.py — 春考汽修 · AI 自适应刷题（v4）
+quiz_app.py — 春考汽修 · AI 自适应刷题（v5）
 
-本版包含：
-1. 多选题用逐项 checkbox（选项全部可见），提交后静态回显 ✅/❌
-2. AI 诊断改成结构化 JSON + finish_reason 检测 + 自动重试，杜绝半截报告
-3. 学情诊断落库（diagnoses 表），刷新不丢，点按钮才更新
-4. 错题本：答错自动入库，再答对一次自动移出，可一键抽 10 道重练
-5. 学情分析：分章节正确率 + 薄弱点 + AI 诊断 + 针对薄弱章节抽题
-6. 每轮 10 题，AI 变式题每轮上限 3 道，做题时可要「不剧透」的提示
-7. 单选/多选以 qtype 为准、答案长度兜底；答案归一化判分
-8. 老库自动迁移（补 qtype 列、重建 attempts/diagnoses 表）
+v5 相对 v4 的改动：
+1. 【重要】关闭 DeepSeek 思考模式（extra_body={"thinking": {"type": "disabled"}}）
+   —— deepseek-flash 默认开思考，思维链会吃掉 max_tokens，导致出题/提示随机被截断
+2. 新增索引：questions(topic)、attempts(student, qid)，3000+ 题时抽题不退化
+3. 错题本页面最多渲染 30 条（数据库仍保留全部，重练时随机抽 10 道）
+4. 侧边栏显示题库总量，方便确认加载正常
+
+v4 已有：
+- 多选题逐项 checkbox，提交后静态回显 ✅/❌
+- AI 诊断结构化 JSON + finish_reason 检测 + 自动重试 + 落库
+- 错题本（再答对自动移出）、学情分析、薄弱章节专项练习
+- 每轮 10 题，AI 变式题每轮上限 3 道，做题时可要启发式提示
+- qtype 题型字段自动迁移、答案归一化判分、老库自动补表
 
 依赖：streamlit / pandas / openai / syllabus.py
 """
@@ -37,10 +41,15 @@ DB_PATH = Path(__file__).resolve().parent / "tiku.db"
 API_BASE = "https://api.deepseek.com"
 MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-flash")
 
+# deepseek-flash 默认开启思考模式，思维链也计入 max_tokens，
+# 会让出题/提示/诊断随机被截断，这里对结构化任务统一关掉。
+NO_THINKING = {"thinking": {"type": "disabled"}}
+
 QUESTIONS_PER_ROUND = 10      # 每轮题量
 MAX_VARIANTS_PER_ROUND = 3    # 每轮 AI 变式题上限
 WEAK_ACCURACY = 0.6           # 正确率低于 60% 视为薄弱
 WEAK_MIN_ATTEMPTS = 2         # 至少做 2 题才纳入薄弱判定
+WRONG_BOOK_DISPLAY = 30       # 错题本页面最多渲染多少条
 DEFAULT_STUDENT = "同学"
 
 RANDOM_CHAPTER = "随机抽题"
@@ -106,7 +115,7 @@ def db():
 
 @st.cache_resource(show_spinner=False)
 def ensure_db():
-    """建表 + 老库补 qtype 列并回填 + attempts/diagnoses 表 + WAL。"""
+    """建表 + 老库补 qtype 列并回填 + 索引 + WAL。"""
     with db() as conn:
         try:
             conn.execute("PRAGMA journal_mode=WAL")
@@ -137,6 +146,8 @@ def ensure_db():
         for rid, ans in todo:
             conn.execute("UPDATE questions SET qtype = ? WHERE id = ?", (guess_qtype(ans), rid))
 
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_questions_topic ON questions(topic)")
+
         # 答题流水：错题本和学情分析都基于这张表
         conn.execute(
             """
@@ -158,6 +169,9 @@ def ensure_db():
             """
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_attempts_student ON attempts(student)")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_attempts_student_qid ON attempts(student, qid)"
+        )
 
         # 学情诊断报告：落库，刷新不丢
         conn.execute(
@@ -172,6 +186,14 @@ def ensure_db():
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_diag_student ON diagnoses(student)")
     return True
+
+
+def count_questions() -> int:
+    try:
+        with db() as conn:
+            return conn.execute("SELECT COUNT(*) FROM questions").fetchone()[0]
+    except sqlite3.Error:
+        return 0
 
 
 # ============================== 题目读取 ==============================
@@ -360,11 +382,11 @@ def get_client() -> OpenAI:
     if not api_key:
         st.error("❌ 未找到 DEEPSEEK_API_KEY，请在 .streamlit/secrets.toml 或环境变量中配置。")
         st.stop()
-    return OpenAI(api_key=api_key, base_url=API_BASE, timeout=60, max_retries=1)
+    return OpenAI(api_key=api_key, base_url=API_BASE, timeout=90, max_retries=1)
 
 
 def call_json(prompt: str, max_tokens: int = 2000, temperature: float = 0.4, attempts: int = 2) -> dict:
-    """强制 JSON 输出；截断或解析失败会自动重试，避免把半截内容当成结果。"""
+    """强制 JSON 输出；关掉思考模式，截断/解析失败自动重试。"""
     last = None
     for _ in range(attempts):
         try:
@@ -374,6 +396,7 @@ def call_json(prompt: str, max_tokens: int = 2000, temperature: float = 0.4, att
                 temperature=temperature,
                 max_tokens=max_tokens,
                 response_format={"type": "json_object"},
+                extra_body=NO_THINKING,
             )
             choice = resp.choices[0]
             if choice.finish_reason == "length":
@@ -528,6 +551,7 @@ def generate_hint(q: dict) -> str:
         messages=[{"role": "user", "content": prompt}],
         temperature=0.5,
         max_tokens=400,
+        extra_body=NO_THINKING,
     )
     return resp.choices[0].message.content.strip()
 
@@ -797,7 +821,7 @@ def render_quiz_page(student: str) -> None:
             if st.button("🔄 重新开始本轮", use_container_width=True):
                 start_round(selected, student, "chapter")
                 st.rerun()
-            st.caption(f"本轮共 {QUESTIONS_PER_ROUND} 题，答错自动进错题本。")
+            st.caption(f"题库共 {count_questions()} 道 ｜ 本轮 {QUESTIONS_PER_ROUND} 题，答错自动进错题本。")
 
     phase = st.session_state.get("phase", "empty")
     if phase == "empty":
@@ -834,7 +858,10 @@ def render_wrong_book(student: str) -> None:
             st.warning("错题数据解析失败，暂时无法重练。")
 
     st.divider()
-    for r in items:
+    shown = items[:WRONG_BOOK_DISPLAY]
+    if len(items) > WRONG_BOOK_DISPLAY:
+        st.caption(f"下面只显示最近 {WRONG_BOOK_DISPLAY} 条（共 {len(items)} 条，重练时会从全部错题里随机抽）")
+    for r in shown:
         try:
             opts = parse_options(r["options"]) if r["options"] else []
         except Exception:
